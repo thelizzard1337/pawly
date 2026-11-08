@@ -2,20 +2,30 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 from fastapi import UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from starlette.concurrency import run_in_threadpool
 
 from app.api.errors import fail
 from app.core.security import utcnow
-from app.db.models import MediaAsset, PhotoSearch
+from app.cv import spec
+from app.db.models import MediaAsset, MediaFeature, PhotoSearch
 from app.modules.listings import service as listings
 from app.modules.listings.schemas import PhotoOut
 from app.modules.media.images import InvalidImage, normalize_image
 
 
-async def upload(db, user, file: UploadFile, settings, storage, listing_id: UUID | None = None):
+async def upload(
+    db, user, file: UploadFile, settings, storage, listing_id: UUID | None = None, bbox=None
+):
     # Reserve before IO; pending rows also count toward the limit.
     uid, user_id = uuid4(), user.id
+    crop = None
+    if bbox is not None:
+        try:
+            crop = spec.BBox.parse(bbox)
+        except spec.InvalidCrop:
+            await file.close()
+            fail(422, "invalid_crop")
     if listing_id:
         row = await listings.load(db, listing_id, user, edit=True, lock=True)
         if row.status not in ("draft", "active"):
@@ -61,6 +71,9 @@ async def upload(db, user, file: UploadFile, settings, storage, listing_id: UUID
             b"".join(chunks),
             settings.image_max_pixels,
         )
+        if crop is not None:
+            # Validated against the canonical (EXIF-oriented) size before anything is stored.
+            spec.crop_spec(crop, normalized.width, normalized.height)
         await run_in_threadpool(storage.write, media.storage_key, normalized.content)
         if listing_id:
             # Same lock order as delete/publish: listing, then media.
@@ -81,6 +94,7 @@ async def upload(db, user, file: UploadFile, settings, storage, listing_id: UUID
             normalized.height,
         )
         media.content_type, media.size_bytes = "image/jpeg", len(normalized.content)
+        media.crop_bbox = crop.as_list() if crop is not None else None
         media.status = "ready"
         await db.commit()
     except Exception as exc:
@@ -91,6 +105,8 @@ async def upload(db, user, file: UploadFile, settings, storage, listing_id: UUID
         await run_in_threadpool(storage.delete, f"{uid}.jpg")
         if isinstance(exc, InvalidImage):
             fail(422, "invalid_image")
+        if isinstance(exc, spec.InvalidCrop):
+            fail(422, "invalid_crop")
         raise
     finally:
         await file.close()
@@ -124,6 +140,34 @@ async def delete_photo(db, user, listing_id, photo_id, storage):
     key = photo.storage_key
     await db.commit()
     await run_in_threadpool(storage.delete, key)
+
+
+async def set_crop(db, user, listing_id, photo_id, bbox):
+    """Store a new crop for a listing photo. Old feature rows stay as superseded history; the CV
+    worker computes features for the new crop (same lock order: listing, then media)."""
+    from app.modules.cv_index.repository import supersede_media
+
+    row = await listings.load(db, listing_id, user, edit=True, lock=True)
+    if row.status not in ("draft", "active"):
+        fail(409, "listing_not_editable")
+    photo = await db.scalar(
+        select(MediaAsset)
+        .where(MediaAsset.id == photo_id, MediaAsset.listing_id == listing_id)
+        .with_for_update()
+    )
+    if photo is None or photo.status != "ready":
+        fail(404, "photo_not_found")
+    crop = bbox.to_spec() if bbox is not None else None
+    try:
+        spec.crop_spec(crop, photo.width, photo.height)
+    except spec.InvalidCrop:
+        fail(422, "invalid_crop")
+    new_value = crop.as_list() if crop is not None else None
+    if new_value != photo.crop_bbox:
+        photo.crop_bbox = new_value
+        await supersede_media(db, photo.id)
+    await db.commit()
+    return PhotoOut.model_validate(photo)
 
 
 async def readable(db, uid, user):
@@ -175,6 +219,15 @@ async def cleanup(sessions, storage, stale_seconds=3600):
         keys = [row.storage_key for row in rows]
         for row in rows:
             row.status = "deleted"
+        await db.flush()
+        # Derived CV features share the lifetime of their media (photo_searches keep NULL).
+        features = await db.execute(
+            delete(MediaFeature).where(
+                MediaFeature.media_id.in_(
+                    select(MediaAsset.id).where(MediaAsset.status == "deleted")
+                )
+            )
+        )
         await db.commit()
     for key in keys:
         await run_in_threadpool(storage.delete, key)
@@ -192,4 +245,8 @@ async def cleanup(sessions, storage, stale_seconds=3600):
         if exists is None:
             await run_in_threadpool(storage.delete, key)
             orphans += 1
-    return {"cleaned_media": len(keys), "orphans": orphans}
+    return {
+        "cleaned_media": len(keys),
+        "orphans": orphans,
+        "deleted_features": features.rowcount,
+    }

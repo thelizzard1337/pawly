@@ -39,7 +39,9 @@ async def app(tmp_path):
             assert actual == settings.db_name and actual.endswith("_test")
             await db.execute(
                 text(
-                    "TRUNCATE photo_search_results, photo_searches, contact_requests, "
+                    "TRUNCATE photo_search_results, photo_searches, media_features, "
+                    "cv_worker_status, "
+                    "contact_requests, "
                     "adoption_requests, "
                     "media_assets, listings, shelter_members, shelters, refresh_sessions, "
                     "user_contacts, users CASCADE"

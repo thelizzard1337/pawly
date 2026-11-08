@@ -87,6 +87,7 @@ class PhotoOut(BaseModel):
     width: int | None
     height: int | None
     position: int | None
+    crop_bbox: list[float] | None = None
 
 
 class ListingOut(ListingFields):

@@ -1,0 +1,9 @@
+# Optional: docker compose -f compose.yaml -f compose.gpu.yaml --profile ml run --rm ml ...
+# Requires the NVIDIA container runtime. Never needed for `docker compose up` or CPU training.
+services:
+  ml:
+    image: pawly-ml-gpu:local
+    build:
+      context: .
+      target: ml-gpu
+    gpus: all

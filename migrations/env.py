@@ -8,9 +8,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.core.config import Settings
 from app.db import models  # noqa: F401
 from app.db.base import Base
-from app.db.models import Geography
+from app.db.models import Geography, Vector
 
 ischema_names["geography"] = Geography
+ischema_names["vector"] = Vector
 
 
 def include_name(name, type_, parent_names):
