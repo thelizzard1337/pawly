@@ -1,0 +1,137 @@
+x-environment: &environment
+  APP_ENV: ${APP_ENV:-development}
+  DEBUG: ${DEBUG:-false}
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: ${POSTGRES_DB:-pawly}
+  DB_USER: ${POSTGRES_USER:-pawly}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-unsafe-dev-password}
+  JWT_SECRET: ${JWT_SECRET:-unsafe-dev-only-pawly-secret-change-before-production}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8000","http://127.0.0.1:8000"]}
+  MEDIA_ROOT: /data/media
+  CV_MODE: ${CV_MODE:-mock}
+  SEARCH_TTL_SECONDS: ${SEARCH_TTL_SECONDS:-86400}
+
+x-backend: &backend
+  image: pawly-backend:local
+  build:
+    context: .
+    target: runtime
+  environment: *environment
+  init: true
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pawly}
+      POSTGRES_USER: ${POSTGRES_USER:-pawly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unsafe-dev-password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *backend
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - media_data:/data/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - media_data:/data/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+  db-test:
+    profiles: ["test"]
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: pawly_test
+      POSTGRES_USER: pawly_test
+      POSTGRES_PASSWORD: isolated-test-password
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "pawly_test", "-d", "pawly_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      <<: *environment
+      APP_ENV: test
+      DEBUG: "false"
+      COOKIE_SECURE: "false"
+      CORS_ORIGINS: '["http://localhost:8000","http://127.0.0.1:8000"]'
+      CV_MODE: mock
+      JWT_SECRET: unsafe-dev-only-pawly-secret-change-before-production
+      DB_HOST: db-test
+      DB_NAME: pawly_test
+      DB_USER: pawly_test
+      DB_PASSWORD: isolated-test-password
+      MEDIA_ROOT: /data/media
+      PAWLY_INTEGRATION: "1"
+    depends_on:
+      db-test:
+        condition: service_healthy
+    logging: *logging
+
+  smoke:
+    profiles: ["smoke"]
+    build:
+      context: .
+      target: test
+    command: ["python", "-m", "scripts.smoke", "http://api:8000"]
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    logging: *logging
+
+volumes:
+  pg_data:
+  media_data:
