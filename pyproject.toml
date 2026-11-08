@@ -13,12 +13,26 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "httpx>=0.28,<1", "asgi-lifespan>=2.1,<3", "ruff>=0.9,<1", "pyyaml>=6,<7"]
+# CV worker and training/evaluation only. The API/migrate image does not install this group.
+ml = ["torch==2.14.1", "torchvision==0.29.1", "numpy>=2.1,<3"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-markers = ["integration: requires isolated PostgreSQL/PostGIS"]
+markers = [
+  "integration: requires isolated PostgreSQL/PostGIS",
+  "cv_real: requires torch and the pinned pretrained weights (CV image)",
+]
 
 [tool.ruff]
 target-version = "py312"

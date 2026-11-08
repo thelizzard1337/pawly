@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import distinct_on
 
 from app.core.security import utcnow
 from app.db.models import Listing, MediaAsset, PhotoSearch, PhotoSearchResult
-from app.integrations.cv.matcher import Candidate, PhotoMatcher
+from app.integrations.cv.matcher import Candidate, MatchOutcome, PhotoMatcher
 from app.modules.listings.repository import apply_filters, public_conditions
 from app.modules.listings.schemas import Filters
 
@@ -19,6 +19,10 @@ class Job:
     query_media_id: UUID
     scope: dict
     limit: int
+    api_version: str = "v1"
+    crop_bbox: list[float] | None = None
+    breed_text: str | None = None
+    coat_color_text: str | None = None
 
 
 async def recover(sessions, settings):
@@ -67,12 +71,31 @@ async def claim(sessions, settings) -> Job | None:
         row.lease_until = utcnow() + timedelta(seconds=settings.worker_lease_seconds)
         row.attempts += 1
         row.started_at, row.error_code = utcnow(), None
-        job = Job(row.id, row.lease_token, row.query_media_id, row.scope, row.limit)
+        job = Job(
+            row.id,
+            row.lease_token,
+            row.query_media_id,
+            row.scope,
+            row.limit,
+            row.api_version,
+            row.crop_bbox,
+            row.breed_text,
+            row.coat_color_text,
+        )
         await db.commit()  # Release the claim transaction before matching.
         return job
 
 
-async def execute(sessions, matcher: PhotoMatcher, job: Job):
+async def execute(sessions, matcher: PhotoMatcher, job: Job) -> MatchOutcome:
+    if hasattr(matcher, "search"):
+        return await matcher.search(sessions, job)
+    # Original adapter shape (mock-style ``match`` over cover photos); always labelled mock.
+    query_hash, candidates = await legacy_candidates(sessions, job)
+    return MatchOutcome.mock(await matcher.match(query_hash, candidates, job.limit))
+
+
+async def legacy_candidates(sessions, job: Job) -> tuple[str, list[Candidate]]:
+    """Mock-only corpus: one cover photo per eligible listing (no visual features)."""
     async with sessions() as db:
         query = await db.get(MediaAsset, job.query_media_id)
         if query is None or query.status != "ready":
@@ -94,10 +117,12 @@ async def execute(sessions, matcher: PhotoMatcher, job: Job):
             MediaAsset.id,
         )
         candidates = [Candidate(*row) for row in await db.execute(stmt)]
-    return await matcher.match(query_hash, candidates, job.limit)
+    return query_hash, candidates
 
 
-async def finalize(sessions, job, matches):
+async def finalize(sessions, job, outcome: MatchOutcome | list):
+    if isinstance(outcome, list):  # legacy callers pass mock candidates directly
+        outcome = MatchOutcome.mock(outcome)
     async with sessions() as db:
         row = await db.scalar(
             select(PhotoSearch)
@@ -113,7 +138,7 @@ async def finalize(sessions, job, matches):
         if row is None:
             return False
         await db.execute(delete(PhotoSearchResult).where(PhotoSearchResult.search_id == row.id))
-        for rank, match in enumerate(matches, 1):
+        for rank, match in enumerate(outcome.matches[: row.limit], 1):
             db.add(
                 PhotoSearchResult(
                     search_id=row.id,
@@ -121,8 +146,17 @@ async def finalize(sessions, job, matches):
                     matched_media_id=match.media_id,
                     rank=rank,
                     similarity_score=None,
+                    ranking_score=match.score,
                 )
             )
+        row.provider, row.model_version = outcome.provider, outcome.model_version
+        row.cv_mode, row.pipeline_id = outcome.cv_mode, outcome.pipeline_id
+        row.embedding_space_id, row.fusion_version = (
+            outcome.embedding_space_id,
+            outcome.fusion_version,
+        )
+        row.outcome, row.reason_code = outcome.outcome, outcome.reason_code
+        row.query_feature_id, row.search_meta = outcome.query_feature_id, outcome.meta
         row.status, row.finished_at = "completed", utcnow()
         row.lease_token = row.lease_until = None
         row.error_code = None

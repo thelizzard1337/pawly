@@ -12,11 +12,39 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Text as SQLText
+from sqlalchemy import cast as sql_cast
+from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, JSONB
+from sqlalchemy.orm import Mapped, deferred, mapped_column
 from sqlalchemy.types import UserDefinedType
 
 from app.db.base import Base, Created, Identity, Updated
+
+
+class Vector(UserDefinedType):
+    """pgvector ``vector`` without a fixed dimension; a CHECK ties it to ``dimension``.
+
+    Values are sent as text and cast explicitly, so no asyncpg type codec is required.
+    """
+
+    cache_ok = True
+
+    def get_col_spec(self, **kw):
+        return "vector"
+
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            return "[" + ",".join(repr(float(v)) for v in value) + "]"
+
+        return process
+
+    def bind_expression(self, bindvalue):
+        return sql_cast(sql_cast(bindvalue, SQLText), self)
+
+
+FloatArray = ARRAY(DOUBLE_PRECISION)
 
 
 class Geography(UserDefinedType):
@@ -155,6 +183,8 @@ class MediaAsset(Identity, Created, Base):
     height: Mapped[int | None]
     position: Mapped[int | None]
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # Optional user crop for listing photos: normalized [x_min, y_min, x_max, y_max] (crop-v1).
+    crop_bbox: Mapped[list[float] | None] = mapped_column(FloatArray)
 
 
 class AdoptionRequest(Identity, Updated, Base):
@@ -198,7 +228,18 @@ class PhotoSearch(Identity, Created, Base):
     __tablename__ = "photo_searches"
     __table_args__ = (
         CheckConstraint("status IN ('queued','running','completed','failed')", name="status"),
-        CheckConstraint('"limit" BETWEEN 1 AND 5', name="limit"),
+        CheckConstraint('"limit" BETWEEN 1 AND 50', name="limit"),
+        CheckConstraint("api_version IN ('v1','v2')", name="api_version"),
+        CheckConstraint("api_version <> 'v1' OR \"limit\" <= 5", name="legacy_limit"),
+        CheckConstraint(
+            "api_version <> 'v2' OR (breed_text IS NOT NULL AND length(trim(breed_text)) > 0 "
+            "AND coat_color_text IS NOT NULL AND length(trim(coat_color_text)) > 0)",
+            name="v2_user_text",
+        ),
+        CheckConstraint("outcome IS NULL OR outcome IN ('candidates','rejected')", name="outcome"),
+        CheckConstraint(
+            "(outcome = 'rejected') = (reason_code IS NOT NULL)", name="outcome_reason"
+        ),
         CheckConstraint("attempts >= 0", name="attempts"),
         CheckConstraint(
             "status <> 'running' OR (lease_token IS NOT NULL AND lease_until IS NOT NULL)",
@@ -234,13 +275,32 @@ class PhotoSearch(Identity, Created, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # v2 contract. Raw user text is kept verbatim; *_norm are search helpers only.
+    api_version: Mapped[str] = mapped_column(String(10), default="v1", server_default="v1")
+    breed_text: Mapped[str | None] = mapped_column(Text)
+    coat_color_text: Mapped[str | None] = mapped_column(Text)
+    breed_text_norm: Mapped[str | None] = mapped_column(Text)
+    coat_color_text_norm: Mapped[str | None] = mapped_column(Text)
+    crop_bbox: Mapped[list[float] | None] = mapped_column(FloatArray)
+    # Domain result next to the unchanged job status: completed + outcome/reason_code.
+    outcome: Mapped[str | None] = mapped_column(String(20))
+    reason_code: Mapped[str | None] = mapped_column(String(40))
+    cv_mode: Mapped[str | None] = mapped_column(String(30))
+    pipeline_id: Mapped[str | None] = mapped_column(String(200))
+    embedding_space_id: Mapped[str | None] = mapped_column(String(120))
+    fusion_version: Mapped[str | None] = mapped_column(String(50))
+    query_feature_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("media_features.id", ondelete="SET NULL")
+    )
+    search_meta: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class PhotoSearchResult(Base):
     __tablename__ = "photo_search_results"
     __table_args__ = (
         UniqueConstraint("search_id", "rank"),
-        CheckConstraint("rank BETWEEN 1 AND 5", name="rank"),
+        CheckConstraint("rank BETWEEN 1 AND 50", name="rank"),
+        # Public similarity is never stored or shown; ranking_score is internal (debug/eval).
         CheckConstraint("similarity_score IS NULL", name="mock_score"),
     )
     search_id: Mapped[UUID] = mapped_column(
@@ -251,3 +311,101 @@ class PhotoSearchResult(Base):
     matched_media_id: Mapped[UUID] = mapped_column(ForeignKey("media_assets.id"))
     rank: Mapped[int]
     similarity_score: Mapped[float | None]
+    ranking_score: Mapped[float | None]
+
+
+class MediaFeature(Identity, Updated, Base):
+    """Versioned CV features of one media crop; listing rows double as the indexing queue."""
+
+    __tablename__ = "media_features"
+    __table_args__ = (
+        CheckConstraint("purpose IN ('listing','query')", name="purpose"),
+        CheckConstraint(
+            "status IN ('pending','running','indexed','rejected','failed')", name="status"
+        ),
+        CheckConstraint("attempts >= 0", name="attempts"),
+        CheckConstraint(
+            "status <> 'running' OR (lease_token IS NOT NULL AND lease_until IS NOT NULL)",
+            name="running_lease",
+        ),
+        CheckConstraint(
+            "status <> 'indexed' OR (embedding IS NOT NULL AND vector_dims(embedding) = dimension "
+            "AND rgb_histogram IS NOT NULL AND cardinality(rgb_histogram) = 64)",
+            name="indexed_complete",
+        ),
+        CheckConstraint(
+            "(status = 'rejected') = (reason_code IS NOT NULL) AND (reason_code IS NULL OR "
+            "reason_code IN ('no_dog','multiple_dogs','invalid_crop','invalid_image',"
+            "'unsupported_image'))",
+            name="rejected_reason",
+        ),
+        CheckConstraint("dimension > 0", name="dimension"),
+        UniqueConstraint("media_id", "crop_hash", "pipeline_id"),
+        Index(
+            "uq_media_features_current",
+            "media_id",
+            "pipeline_id",
+            unique=True,
+            postgresql_where=text("purpose = 'listing' AND superseded_at IS NULL"),
+        ),
+        Index("ix_media_features_claim", "pipeline_id", "status", "available_at"),
+    )
+    media_id: Mapped[UUID] = mapped_column(ForeignKey("media_assets.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    reason_code: Mapped[str | None] = mapped_column(String(40))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    # Provenance of the pipeline that produced (or will produce) this row.
+    pipeline_id: Mapped[str] = mapped_column(String(200))
+    embedding_space_id: Mapped[str] = mapped_column(String(120))
+    cv_mode: Mapped[str] = mapped_column(String(30))
+    backbone: Mapped[str] = mapped_column(String(50))
+    weights_id: Mapped[str] = mapped_column(String(50))
+    preprocessing_id: Mapped[str] = mapped_column(String(50))
+    descriptor_version: Mapped[str] = mapped_column(String(50))
+    gate_id: Mapped[str] = mapped_column(String(80))
+    bundle_id: Mapped[str | None] = mapped_column(String(120))
+    dimension: Mapped[int]
+    # Crop and input identity: replay = canonical media bytes + crop + pipeline manifest.
+    crop_rule: Mapped[str] = mapped_column(String(20))
+    crop_bbox: Mapped[list[float] | None] = mapped_column(FloatArray)
+    crop_box: Mapped[list[int] | None] = mapped_column(ARRAY(Integer))
+    crop_hash: Mapped[str] = mapped_column(String(64))
+    input_sha256: Mapped[str] = mapped_column(String(64))
+    # Model-derived values (never user ground truth).
+    embedding: Mapped[list[float] | None] = deferred(mapped_column(Vector()))
+    rgb_histogram: Mapped[list[float] | None] = mapped_column(FloatArray)
+    dominant_colors: Mapped[list | None] = mapped_column(JSONB)
+    breed_prediction: Mapped[dict | None] = mapped_column(JSONB)
+    color_prediction: Mapped[list[float] | None] = mapped_column(FloatArray)
+    extraction_ms: Mapped[float | None]
+    # Snapshot of user-provided text at indexing time (raw, not ML labels).
+    user_breed_text: Mapped[str | None] = mapped_column(Text)
+    user_color_text: Mapped[str | None] = mapped_column(Text)
+    # Queue state (same lease/fencing pattern as photo_searches).
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+    lease_token: Mapped[UUID | None]
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class CVWorkerStatus(Base):
+    """Heartbeat of CV worker processes; lets the API report ML readiness without torch."""
+
+    __tablename__ = "cv_worker_status"
+    __table_args__ = (CheckConstraint("state IN ('loading','ready','error')", name="state"),)
+    worker_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    cv_mode: Mapped[str] = mapped_column(String(30))
+    provider: Mapped[str] = mapped_column(String(50))
+    state: Mapped[str] = mapped_column(String(20))
+    pipeline_id: Mapped[str | None] = mapped_column(String(200))
+    embedding_space_id: Mapped[str | None] = mapped_column(String(120))
+    bundle_id: Mapped[str | None] = mapped_column(String(120))
+    error_code: Mapped[str | None] = mapped_column(String(200))
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

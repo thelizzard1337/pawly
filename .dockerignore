@@ -8,3 +8,10 @@ __pycache__
 .ruff_cache
 .media
 .verification
+.ml
+data
+artifacts
+*.pt
+*.pth
+*.tar.gz
+*.npz

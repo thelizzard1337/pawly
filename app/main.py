@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from app.api.router import router
+from app.api.router import router, router_v2
 from app.core.config import SCHEMA_REVISION, Settings
 from app.db.session import make_database
 from app.integrations.storage.local import LocalFileStorage
@@ -33,8 +33,9 @@ def create_app(settings: Settings | None = None):
         version="0.1.0",
         debug=config.debug,
         lifespan=lifespan,
-        description="Lost/found and shelter adoption. Photo search uses mock-v1; "
-        "it does not measure visual similarity.",
+        description="Lost/found and shelter adoption. Dog photo search (v2) returns candidate "
+        "listings ranked by pretrained visual embeddings; the order is for manual review and is "
+        "not a probability of identity. CV_MODE=mock is labelled provider mock-v1.",
     )
     app.add_middleware(
         CORSMiddleware,
@@ -74,7 +75,27 @@ def create_app(settings: Settings | None = None):
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return {"status": "ready", "schema_revision": revision}
 
+    @app.get("/health/ml", tags=["health"])
+    async def ml_ready(request: Request):
+        """ML readiness, separate from CRUD readiness: a fresh worker heartbeat in CV_MODE."""
+        from app.modules.cv_index.router import status_payload
+
+        try:
+            async with request.app.state.sessions() as db:
+                payload = await status_payload(db, request.app.state.settings)
+        except SQLAlchemyError:
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+        body = {
+            "status": "ready" if payload["ready"] else "not_ready",
+            "configured_mode": payload["configured_mode"],
+            "provider": payload["provider"],
+            "pipeline_id": payload["pipeline_id"],
+            "workers": payload["workers"],
+        }
+        return JSONResponse(status_code=200 if payload["ready"] else 503, content=body)
+
     app.include_router(router)
+    app.include_router(router_v2)
     return app
 
 

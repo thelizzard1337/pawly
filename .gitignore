@@ -8,3 +8,10 @@ __pycache__/
 htmlcov/
 .media/
 .verification/
+.ml/
+data/
+artifacts/
+*.pt
+*.pth
+*.tar.gz
+*.npz
