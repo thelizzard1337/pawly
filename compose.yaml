@@ -10,8 +10,22 @@ x-environment: &environment
   COOKIE_SECURE: ${COOKIE_SECURE:-false}
   CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8000","http://127.0.0.1:8000"]}
   MEDIA_ROOT: /data/media
-  CV_MODE: ${CV_MODE:-mock}
+  # Real pretrained pipeline by default. mock is for plumbing tests and is always labelled.
+  CV_MODE: ${CV_MODE:-pretrained_features}
+  CV_BACKBONE: ${CV_BACKBONE:-efficientnet_b0}
+  CV_BUNDLE_DIR: ${CV_BUNDLE_DIR:-}
+  CV_DOG_SCORE_THRESHOLD: ${CV_DOG_SCORE_THRESHOLD:-0.5}
+  CV_FUSION: ${CV_FUSION:-embedding-v1}
+  CV_FUSION_RGB_WEIGHT: ${CV_FUSION_RGB_WEIGHT:-0.2}
+  CV_FUSION_HEADS_WEIGHT: ${CV_FUSION_HEADS_WEIGHT:-0.1}
+  CV_TORCH_THREADS: ${CV_TORCH_THREADS:-2}
   SEARCH_TTL_SECONDS: ${SEARCH_TTL_SECONDS:-86400}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
 
 x-backend: &backend
   image: pawly-backend:local
@@ -20,15 +34,25 @@ x-backend: &backend
     target: runtime
   environment: *environment
   init: true
-  logging: &logging
-    driver: json-file
-    options:
-      max-size: 10m
-      max-file: "3"
+  logging: *logging
+
+x-cv: &cv
+  image: pawly-cv:local
+  build:
+    context: .
+    target: cv-runtime
+  environment: *environment
+  init: true
+  logging: *logging
+
+x-db: &db
+  image: pawly-db:local
+  build:
+    context: docker/db
 
 services:
   db:
-    image: postgis/postgis:16-3.4
+    <<: *db
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pawly}
       POSTGRES_USER: ${POSTGRES_USER:-pawly}
@@ -68,20 +92,36 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
 
+  # Search + indexing worker. The only process that loads torch and the models.
   worker:
-    <<: *backend
+    <<: *cv
     command: ["python", "-m", "app.worker"]
     volumes:
       - media_data:/data/media
+      - ml_artifacts:/data/ml:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 45s
 
+  # Datasets, feature caches, training runs and exported bundles (never started by `up`).
+  ml:
+    <<: *cv
+    profiles: ["ml"]
+    command: ["python", "-m", "app.ml", "--help"]
+    environment:
+      <<: *environment
+      ML_ROOT: /data/ml
+    volumes:
+      - ml_artifacts:/data/ml
+    # DataLoader worker processes pass image tensors through shared memory (default is 64 MB).
+    shm_size: 1gb
+    restart: "no"
+
   db-test:
+    <<: *db
     profiles: ["test"]
-    image: postgis/postgis:16-3.4
     environment:
       POSTGRES_DB: pawly_test
       POSTGRES_USER: pawly_test
@@ -97,6 +137,7 @@ services:
 
   test:
     profiles: ["test"]
+    image: pawly-test:local
     build:
       context: .
       target: test
@@ -106,7 +147,10 @@ services:
       DEBUG: "false"
       COOKIE_SECURE: "false"
       CORS_ORIGINS: '["http://localhost:8000","http://127.0.0.1:8000"]'
+      # Backend tests use the labelled mock or explicit test doubles; cv_real tests load the
+      # pinned weights from the image directly.
       CV_MODE: mock
+      CV_FUSION: embedding-v1
       JWT_SECRET: unsafe-dev-only-pawly-secret-change-before-production
       DB_HOST: db-test
       DB_NAME: pawly_test
@@ -121,6 +165,7 @@ services:
 
   smoke:
     profiles: ["smoke"]
+    image: pawly-test:local
     build:
       context: .
       target: test
@@ -135,3 +180,4 @@ services:
 volumes:
   pg_data:
   media_data:
+  ml_artifacts:
